@@ -91,6 +91,7 @@ class Part(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     part_number: str
     project_id: str
+    total_quantity: int = 1
     current_step_index: int = 0
     status: ProcessStatus = ProcessStatus.PENDING
     created_at: datetime = Field(default_factory=now_ist)
@@ -99,15 +100,20 @@ class PartWithStepInfo(BaseModel):
     id: str
     part_number: str
     project_id: str
+    total_quantity: int
     current_step_index: int
     status: ProcessStatus
     created_at: datetime
     total_steps: int  # Actual number of process instances for this work order
     current_step_name: Optional[str] = None  # Name of the current step
+    completed_count: int = 0
+    in_progress_count: int = 0
+    remaining_count: int = 0
 
 class PartCreate(BaseModel):
     part_number: str
     project_id: str
+    total_quantity: int = 1
     process_steps: List[str]  # Required custom process steps for this work order
 
 class ProcessInstance(BaseModel):
@@ -116,6 +122,9 @@ class ProcessInstance(BaseModel):
     step_name: str
     step_index: int
     status: ProcessStatus = ProcessStatus.PENDING
+    remaining_count: int = 0
+    in_progress_count: int = 0
+    completed_count: int = 0
     operator_id: Optional[str] = None
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -145,6 +154,7 @@ class ProcessActionRequest(BaseModel):
     password: str
     process_index: int
     action: str  # "start" or "end"
+    quantity: int = 1
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
@@ -314,16 +324,25 @@ async def get_project_parts(project_id: str, current_user: User = Depends(get_cu
             process_instances.sort(key=lambda x: x["step_index"])
             current_step_name = process_instances[part["current_step_index"]]["step_name"]
         
+        # Calculate total counts across all steps
+        total_completed = sum(pi["completed_count"] for pi in process_instances)
+        total_in_progress = sum(pi["in_progress_count"] for pi in process_instances)
+        total_remaining = part["total_quantity"] - total_completed - total_in_progress
+        
         # Create PartWithStepInfo object
         part_with_info = PartWithStepInfo(
             id=part["id"],
             part_number=part["part_number"],
             project_id=part["project_id"],
+            total_quantity=part.get("total_quantity", 1),
             current_step_index=part["current_step_index"],
             status=part["status"],
             created_at=part["created_at"],
             total_steps=len(process_instances),  # Actual number of steps for this work order
-            current_step_name=current_step_name
+            current_step_name=current_step_name,
+            completed_count=total_completed,
+            in_progress_count=total_in_progress,
+            remaining_count=max(0, total_remaining)
         )
         parts_with_step_info.append(part_with_info)
     
@@ -366,6 +385,10 @@ async def create_part(part_data: PartCreate, current_user: User = Depends(get_cu
     if not part_data.process_steps or len(part_data.process_steps) == 0:
         raise HTTPException(status_code=400, detail="At least one process step must be selected")
     
+    # Validation: Quantity must be positive
+    if part_data.total_quantity <= 0:
+        raise HTTPException(status_code=400, detail="Total quantity must be greater than 0")
+    
     # Verify project exists
     project = await db.projects.find_one({"id": part_data.project_id})
     if not project:
@@ -380,7 +403,10 @@ async def create_part(part_data: PartCreate, current_user: User = Depends(get_cu
         process_instance = ProcessInstance(
             part_id=part.id,
             step_name=step_name,
-            step_index=i
+            step_index=i,
+            remaining_count=part.total_quantity if i == 0 else 0,
+            in_progress_count=0,
+            completed_count=0
         )
         await db.process_instances.insert_one(process_instance.dict())
     
@@ -403,9 +429,20 @@ async def get_part_status(part_id: str, current_user: User = Depends(get_current
     
     process_instances = await db.process_instances.find({"part_id": part_id}).to_list(100)
     
+    # Calculate total counts
+    total_completed = sum(pi["completed_count"] for pi in process_instances)
+    total_in_progress = sum(pi["in_progress_count"] for pi in process_instances)
+    total_remaining = part.get("total_quantity", 1) - total_completed - total_in_progress
+    
     return {
         "part": Part(**part),
-        "process_instances": [ProcessInstance(**pi) for pi in process_instances]
+        "process_instances": [ProcessInstance(**pi) for pi in process_instances],
+        "quantity_summary": {
+            "total_quantity": part.get("total_quantity", 1),
+            "completed_count": total_completed,
+            "in_progress_count": total_in_progress,
+            "remaining_count": max(0, total_remaining)
+        }
     }
 
 @api_router.delete("/parts/{part_id}")
@@ -757,6 +794,10 @@ async def process_action(action_data: ProcessActionRequest, current_user: User =
     """
     Perform a start or end action on a specific process within a work order.
     """
+    # Validate quantity
+    if action_data.quantity <= 0:
+        raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
+    
     # Use session user if password indicates session authentication
     if action_data.password == "session_authenticated":
         user = {
@@ -1064,12 +1105,37 @@ async def get_dashboard_overview(current_user: User = Depends(get_current_user))
                 process_instances.sort(key=lambda x: x["step_index"])
                 current_step = process_instances[part["current_step_index"]]["step_name"]
             
+            # Calculate quantity summary
+            total_completed = sum(pi.get("completed_count", 0) for pi in process_instances)
+            total_in_progress = sum(pi.get("in_progress_count", 0) for pi in process_instances)
+            total_quantity = part.get("total_quantity", 1)
+            total_remaining = total_quantity - total_completed - total_in_progress
+            
+            # Calculate progress percentage based on completed units
+            progress_percentage = (total_completed / total_quantity * 100) if total_quantity > 0 else 0
+            
             dashboard_data.append({
                 "part": Part(**part),
                 "project": Project(**project),
                 "current_step": current_step,
                 "total_steps": len(process_instances),  # Actual number of steps for this work order
-                "progress_percentage": ((part["current_step_index"] + 1) / len(process_instances)) * 100 if len(process_instances) > 0 else 0
+                "progress_percentage": progress_percentage,
+                "quantity_summary": {
+                    "total_quantity": total_quantity,
+                    "completed_count": total_completed,
+                    "in_progress_count": total_in_progress,
+                    "remaining_count": max(0, total_remaining)
+                },
+                "process_details": [
+                    {
+                        "step_name": pi["step_name"],
+                        "step_index": pi["step_index"],
+                        "remaining_count": pi.get("remaining_count", 0),
+                        "in_progress_count": pi.get("in_progress_count", 0),
+                        "completed_count": pi.get("completed_count", 0),
+                        "status": pi["status"]
+                    } for pi in process_instances
+                ]
             })
     
     return dashboard_data

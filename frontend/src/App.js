@@ -1364,6 +1364,7 @@ const Projects = () => {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteItemName, setDeleteItemName] = useState('');
   const [selectedSteps, setSelectedSteps] = useState([]);
+  const [newPartQuantity, setNewPartQuantity] = useState(1);
   const [showStepSelector, setShowStepSelector] = useState(false);
 
   // Available manufacturing steps
